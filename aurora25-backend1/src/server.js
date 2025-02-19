@@ -20,6 +20,12 @@ const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 // Set secure HTTP headers
 app.use(helmet());
 
+const MAX_RETRIES = 5;
+const RETRY_DELAY = 1000; // 1 second delay between retries
+
+// Helper function to delay execution
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Enable Cross-Origin Resource Sharing
 const corsOptions = {
     origin: ["https://aurora25-passgen.vercel.app", "http://localhost:3000", "https://aurora25-qrscan.vercel.app"],
@@ -57,6 +63,25 @@ const auth = new google.auth.GoogleAuth({
 const drive = google.drive({ version: "v3", auth });
 
 
+async function uploadToDriveWithRetry(drive, fileMetadata, mediaData, maxRetries = MAX_RETRIES) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const response = await drive.files.create({
+                resource: fileMetadata,
+                media: mediaData,
+                fields: "id, name, parents",
+            });
+            return response;
+        } catch (error) {
+            if (attempt === maxRetries) {
+                throw new Error(`Failed to upload after ${maxRetries} attempts: ${error.message}`);
+            }
+            console.log(`Upload attempt ${attempt} failed. Retrying in ${RETRY_DELAY / 1000} seconds...`);
+            await delay(RETRY_DELAY);
+        }
+    }
+}
+
 // --- Endpoints ---
 app.post("/api/uploadPdf", upload.single("pdf"), async (req, res) => {
     try {
@@ -69,43 +94,39 @@ app.post("/api/uploadPdf", upload.single("pdf"), async (req, res) => {
         const { email, rollNumber } = req.body;
         console.log("Received from client:", { email, rollNumber });
 
-        const user = await User.findOne({ email: email })
-
+        const user = await User.findOne({ email: email });
 
         // Convert the PDF buffer to a stream
         const pdfBuffer = req.file.buffer;
         const stream = Readable.from(pdfBuffer);
 
-
         // Set the file metadata
         const fileMetadata = {
-            // use the original name or a custom name
             name: `aurora25-${rollNumber}-pass.pdf`,
             parents: [process.env.FOLDER_ID]
         };
 
-        // Upload to Google Drive
-        const response = await drive.files.create({
-            resource: fileMetadata,
-            media: {
+        // Upload to Google Drive with retry logic
+        try {
+            const response = await uploadToDriveWithRetry(drive, fileMetadata, {
                 mimeType: "application/pdf",
                 body: stream,
-            },
-            fields: "id, name, parents",
-        });
+            });
 
-        const fileId = response.data.id;
-        user.file_id = fileId
-        await user.save()
-
-        console.log("File uploaded to Drive, ID:", fileId);
-        res.status(200).json({ message: "pass generated!" });
+            const fileId = response.data.id;
+            user.file_id = fileId;
+            await user.save();
+            console.log("File uploaded to Drive, ID:", fileId);
+            res.status(200).json({ message: "pass generated!" });
+        } catch (uploadError) {
+            console.error("Upload failed after all retries:", uploadError);
+            res.status(500).json({ error: "Network error: Failed to upload PDF after multiple attempts." });
+        }
     } catch (error) {
-        console.error("Error uploading PDF:", error);
-        res.status(500).json({ error: "Failed to upload PDF." });
+        console.error("Error in request processing:", error);
+        res.status(500).json({ error: "Failed to process request." });
     }
 });
-
 /**
  * Registration Endpoint
  * - Validates input using express-validator.
